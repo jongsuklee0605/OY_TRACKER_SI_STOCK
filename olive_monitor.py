@@ -50,6 +50,7 @@ RETRY_429 = 2            # 429가 뜨면 같은 상품을 최대 몇 번 다시 
 WAIT_429 = (20, 40)      # 429가 떴을 때 기다리는 시간 범위(초)
 GAP = (1.0, 2.0)         # 평소 상품 사이 대기 시간 범위(초)
 MAX_OPT_REMAIN = 15      # 상품 하나에서 남은 수량을 확인할 옵션 최대 개수
+MAX_OPT_SELECT_FAIL = 2  # 옵션 선택이 처음부터 이만큼 연속 실패하면 그 상품은 남은 수량 확인 포기
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 STEALTH_JS = "Object.defineProperty(navigator, 'webdriver', {get: () => undefined}); Object.defineProperty(navigator, 'languages', {get: () => ['ko-KR', 'ko', 'en-US']}); window.chrome = {runtime: {}};"
@@ -92,6 +93,31 @@ MARK_QTY_JS = """() => {
   if (!inp) return false;
   inp.setAttribute('data-qty-target', '1');
   return true;
+}"""
+
+# 옵션 글자를 직접 클릭하는 대신, 그 글자를 감싼 클릭 가능한 칸을 자바스크립트로 클릭
+JS_CLICK = """(el) => {
+  const t = el.closest('li, button, a, label, [role=option], [onclick]') || el;
+  t.click();
+  return true;
+}"""
+
+# 옵션 선택이 안 될 때 원인을 알기 위한 진단 정보
+DIAG_JS = """(name) => {
+  const skip = ['checkbox', 'radio', 'hidden', 'button', 'submit'];
+  const inputs = [...document.querySelectorAll('input')]
+    .filter(i => i.offsetParent !== null && !skip.includes(i.type))
+    .map(i => i.type + ':' + i.value).slice(0, 6);
+  const leaves = [...document.querySelectorAll('body *')]
+    .filter(e => e.children.length === 0 && (e.textContent || '').trim() === name);
+  const shown = leaves.filter(e => e.getClientRects().length > 0).length;
+  let html = '';
+  if (leaves.length) {
+    const box = leaves[0].closest('li, button, a, [role=option]') || leaves[0].parentElement || leaves[0];
+    html = box.outerHTML.replace(/\\s+/g, ' ').slice(0, 300);
+  }
+  const sel = document.querySelectorAll('select').length;
+  return {inputs, total: leaves.length, shown, html, sel};
 }"""
 
 
@@ -452,40 +478,77 @@ def read_remain(page, watch=True):
         return None
 
 
+def option_selected(page, ms=1500):
+    """옵션이 실제로 선택됐는지 (수량 칸이 생겼거나 재고 안내가 떴는지) 확인"""
+    end = time.time() + ms / 1000
+    while True:
+        try:
+            if page.evaluate(MARK_QTY_JS) or watched_remain(page) is not None:
+                return True
+        except Exception:
+            pass
+        if time.time() >= end:
+            return False
+        page.wait_for_timeout(250)
+
+
+def find_visible_text(scope, text, exact=True):
+    loc = scope.get_by_text(text, exact=exact)
+    for i in range(min(loc.count(), 8)):
+        if loc.nth(i).is_visible():
+            return loc.nth(i)
+    return None
+
+
 def select_option(page, oname):
-    """옵션 목록을 열고 해당 옵션을 클릭. 성공하면 True."""
+    """옵션 목록을 열고 해당 옵션을 선택. 실제로 선택된 게 확인되면 True."""
     header = find_option_header(page)
     if header is None:
         return False
     box = header.locator("xpath=ancestor::*[contains(., '원')][1]")
 
-    def visible_item():
-        loc = box.get_by_text(oname, exact=True)
-        for i in range(min(loc.count(), 5)):
-            if loc.nth(i).is_visible():
-                return loc.nth(i)
-        return None
-
-    item = visible_item()
-    if item is None:
-        header.click()
-        page.wait_for_timeout(700)
-        item = visible_item()
-    if item is None:
-        return False
-    item.click(timeout=3000)
-    page.wait_for_timeout(300)
-    return True
+    # (찾는 범위, 정확히 일치, 자바스크립트 클릭 여부) 순서대로 시도
+    attempts = [
+        (box, True, False),
+        (box, True, True),
+        (page, True, True),
+        (page, False, True),
+    ]
+    for scope, exact, use_js in attempts:
+        try:
+            item = find_visible_text(scope, oname, exact)
+            if item is None:
+                h = find_option_header(page)
+                if h is not None:
+                    h.click()
+                    page.wait_for_timeout(700)
+                item = find_visible_text(scope, oname, exact)
+            if item is None:
+                continue
+            if use_js:
+                item.evaluate(JS_CLICK)
+            else:
+                item.click(timeout=3000)
+            if option_selected(page):
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def read_option_remains(page, goods_no, options):
     """판매중인 옵션을 하나씩 골라 남은 수량을 읽는다. 두 번째 옵션부터는 페이지를 새로 연다."""
     remains = {}
     first = True
+    select_ok = 0
+    select_fail = 0
     targets = [n for n, sold in options.items() if not sold][:MAX_OPT_REMAIN]
     for oname in targets:
         if time.time() - T0 > TIME_LIMIT - 60:
             log(f"{goods_no} 시간 부족 → 옵션 남은 수량 확인 일부 생략")
+            break
+        if select_ok == 0 and select_fail >= MAX_OPT_SELECT_FAIL:
+            log(f"{goods_no} 옵션 선택이 계속 안 됨 → 이 상품은 남은 수량 확인 생략")
             break
         try:
             if not first:
@@ -494,14 +557,20 @@ def read_option_remains(page, goods_no, options):
             first = False
             start_watch(page)                       # 옵션을 고르기 전부터 안내를 지켜봄
             if not select_option(page, oname):
-                log(f"{goods_no} 옵션 '{oname[:20]}' 선택 실패(무시)")
+                select_fail += 1
+                try:
+                    d = page.evaluate(DIAG_JS, oname)
+                    log(f"{goods_no} 옵션 '{oname[:20]}' 선택 안 됨 | 같은글자 {d['total']}개(보임 {d['shown']}) "
+                        f"| select태그 {d['sel']}개 | 입력칸 {d['inputs']} | 구조 {d['html']}")
+                except Exception as e:
+                    log(f"{goods_no} 옵션 '{oname[:20]}' 선택 안 됨 (진단 실패: {str(e)[:60]})")
                 continue
+            select_ok += 1
             r = wait_remain(page, 2000)             # 옵션을 고르자마자 뜨는 안내
             if r is None:
                 r = read_remain(page, watch=False)  # 안 뜨면 수량 칸 / + 버튼을 눌러 봄
             if r is None:
-                has_qty = page.evaluate(MARK_QTY_JS)
-                log(f"{goods_no} 옵션 '{oname[:20]}' 남은 수량 안내 못 찾음 (수량칸 {'있음' if has_qty else '없음'})")
+                log(f"{goods_no} 옵션 '{oname[:20]}' 선택은 됐지만 남은 수량 안내 못 찾음")
             remains[oname] = r
         except Exception as e:
             log(f"{goods_no} 옵션 '{oname[:20]}' 남은 수량 확인 실패(무시): {str(e)[:60]}")
