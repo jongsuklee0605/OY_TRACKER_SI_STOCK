@@ -630,4 +630,150 @@ def run_stock(page, prev):
         rm = {}
         if g in stock:
             s = stock[g]
-            rm =
+            rm = s.get("remains", {})
+            if s["options"]:
+                valid = {k for k, sold in s["options"].items() if not sold}
+            else:
+                valid = set() if s["soldout"] else {""}
+            # 품절됐거나 없어진 옵션은 '부족' 상태를 지움 (품절 알림이 따로 감)
+            lows = {k: True for k, v in old_lows.items() if v and k in valid}
+            for k, r in rm.items():
+                if r is None:
+                    continue                       # 이번에 숫자를 못 읽었으면 이전 상태 유지
+                was = old_lows.get(k, False)
+                now = r < LOW_STOCK
+                label = f"[{k}] " if k else ""
+                if now:
+                    lows[k] = True
+                    if not was:
+                        low_msgs.append(f"  · 🟠 재고 부족 {label}{r}개 남음 ({LOW_STOCK}개 미만)")
+                else:
+                    lows.pop(k, None)
+                    if was:
+                        low_msgs.append(f"  · 🟢 재고 다시 넉넉함 {label}{r}개 남음")
+            cur = {"name": s["name"] or old.get("name", ""), "soldout": s["soldout"], "options": s["options"],
+                   "remains": {k: r for k, r in rm.items() if r is not None}, "lows": lows}
+        else:
+            cur = {"name": old.get("name", ""), "soldout": old.get("soldout"), "options": old.get("options", {}),
+                   "remains": old.get("remains", {}), "lows": old_lows}
+            if g in fails:
+                now_errors[g] = fails[g]
+            elif g in prev_errors:
+                now_errors[g] = prev_errors[g]
+        now_items[g] = cur
+
+        changed = (old.get("soldout"), old.get("options", {})) != (cur["soldout"], cur["options"])
+        if changed and g in stock:
+            changed_cnt += 1
+        if low_msgs:
+            low_cnt += 1
+        if not (changed or low_msgs or ALWAYS) or g not in stock:
+            continue
+        if changed and g in old_items:
+            tag = "⚠️ 변화 "
+        elif any("🟠" in m for m in low_msgs):
+            tag = "🟠 재고 부족 "
+        else:
+            tag = ""
+        title = f"{cur['name']} ({g})" if cur["name"] else g
+        lines = [f"{tag}{title}"]
+        opts = cur["options"] or {}
+        if opts:
+            sold = sum(1 for v in opts.values() if v)
+            lines.append(f"  · 재고: 옵션 {len(opts)}개 중 {sold}개 품절 ({stock_label(cur['soldout'])})")
+            old_opts = old.get("options") or {}
+            for oname, v in opts.items():
+                mark = ""
+                if oname in old_opts and old_opts[oname] != v:
+                    mark = f" ← 변화 (이전: {'품절' if old_opts[oname] else '판매중'})"
+                rem = f" · 남은 {rm[oname]}개" if rm.get(oname) is not None else ""
+                lines.append(f"      - {oname}: {stock_label(v)}{rem}{mark}")
+        else:
+            prev_label = f" (이전: {stock_label(old.get('soldout'))})" if changed and g in old_items else ""
+            rem = f" · 남은 수량 {rm['']}개" if rm.get("") is not None else ""
+            lines.append(f"  · 재고: {stock_label(cur['soldout'])}{prev_label}{rem}")
+        lines.extend(low_msgs)
+        lines.append(f"  {detail_url(g)}")
+        blocks.append("\n".join(lines))
+
+    err_lines = []
+    for g, msg in fails.items():
+        if prev_errors.get(g) != msg:
+            label = now_items[g].get("name") or g
+            err_lines.append(f"{label} ({g}) 재고 실패: {msg}")
+    if stopped:
+        err_lines.append(f"중단: {stopped}")
+        log(f"중단: {stopped}")
+    if err_lines:
+        shown = err_lines[:10]
+        extra = f"\n...외 {len(err_lines) - 10}건" if len(err_lines) > 10 else ""
+        blocks.append("❗ 확인 실패/중단 (이전 값 유지)\n" + "\n".join(shown) + extra)
+
+    has_issue = bool(changed_cnt or low_cnt or err_lines)
+
+    # ALWAYS_NOTIFY=1이면 변화가 없어도 상품별 한 줄 요약을 붙임
+    summary_lines = []
+    if ALWAYS:
+        for g in GOODS:
+            if g not in stock:
+                continue
+            it = now_items[g]
+            opts = it["options"] or {}
+            extra = f" (옵션 {len(opts)}개 중 {sum(opts.values())}개 품절)" if opts else ""
+            r = stock[g].get("remains", {}).get("")
+            if r is not None:
+                extra += f" (남은 수량 {r}개)"
+            summary_lines.append(f"· {it['name'] or g}: {stock_label(it['soldout'])}{extra}")
+
+    if SUMMARY_FILE:
+        Path(SUMMARY_FILE).write_text(json.dumps(
+            {"goods": len(GOODS), "checked": len(stock), "issue": has_issue, "lines": summary_lines},
+            ensure_ascii=False))
+
+    ts = now_ts()
+    if has_issue:
+        send_slack(f"📦 [올리브영 재고 {ts}] 상품 {len(GOODS)}개 확인", blocks)
+    elif SUMMARY_FILE:
+        log("변화 없음 → 통합 알림 job에서 한 번에 전송")
+    elif ALWAYS or NOTIFY_NO_CHANGE:
+        msg = f"✅ [올리브영 재고 {ts}] 상품 {len(GOODS)}개 체크했으나 변경점이 없습니다. (재고 확인 {len(stock)}개)"
+        if summary_lines:
+            msg += "\n" + "\n".join(summary_lines)
+        post_slack(msg)
+    else:
+        log("변화 없음 (알림 생략)")
+
+    return {"items": now_items, "errors": now_errors}
+
+
+# ======================================================================
+
+def main():
+    if MODE not in ("stock", "rank"):
+        sys.exit(f"MODE 값이 잘못됐습니다: {MODE!r} (stock 또는 rank)")
+    if not GOODS:
+        sys.exit("상품번호가 없습니다. (GOODS_NO Secret 확인)")
+
+    prev = load_state(STATE_FILE)
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=["--disable-blink-features=AutomationControlled"])
+        context = browser.new_context(user_agent=UA, locale="ko-KR", timezone_id="Asia/Seoul", viewport={"width": 1366, "height": 900})
+        context.add_init_script(STEALTH_JS)
+        page = context.new_page()
+        try:
+            if MODE == "rank":
+                new_state = run_rank(page, prev)
+            else:
+                new_state = run_stock(page, prev)
+        finally:
+            browser.close()
+
+    # 슬랙 전송이 성공한 뒤에만 상태 저장 (전송 실패 시 다음 실행에서 다시 알림)
+    STATE_FILE.write_text(json.dumps(new_state, ensure_ascii=False))
+    log(f"상태 저장 완료 ({STATE_FILE.name})")
+    log("끝")
+
+
+if __name__ == "__main__":
+    main()
