@@ -60,6 +60,40 @@ PRICE_RE = re.compile(r"\d[\d,]*\s*원")
 NOISE_RE = re.compile(r"^(예약|일시품절|품절|재입고|오늘드림|옵션을 선택|배송|구매수량|총\s)|배송시작|^\d+\s*%|^\(")
 REMAIN_RE = re.compile(r"재고가\s*([\d,]+)\s*개\s*남았")
 
+# 화면에 "재고가 N개 남았습니다" 안내가 잠깐이라도 뜨면 숫자를 기록해 두는 감시 장치
+WATCH_JS = r"""() => {
+  window.__remain = [];
+  if (window.__remainObs) window.__remainObs.disconnect();
+  const re = /재고가\s*([\d,]+)\s*개\s*남았/;
+  const check = node => {
+    const el = node && node.nodeType === 3 ? node.parentElement : node;
+    if (!el || el.nodeType !== 1) return;
+    if ((el.textContent || '').length > 300) return;
+    if (!el.getClientRects || el.getClientRects().length === 0) return;
+    const m = (el.innerText || el.textContent || '').match(re);
+    if (m) window.__remain.push(m[1]);
+  };
+  window.__remainObs = new MutationObserver(list => {
+    for (const m of list) {
+      if (m.type === 'childList') m.addedNodes.forEach(check);
+      else check(m.target);
+    }
+  });
+  window.__remainObs.observe(document.body, {childList: true, subtree: true, characterData: true,
+                                             attributes: true, attributeFilter: ['class', 'style']});
+}"""
+
+# 화면에 보이는 구매수량 칸(값이 1인 입력칸)을 찾아 표시해 둔다
+MARK_QTY_JS = """() => {
+  document.querySelectorAll('[data-qty-target]').forEach(e => e.removeAttribute('data-qty-target'));
+  const skip = ['checkbox', 'radio', 'hidden', 'button', 'submit'];
+  const inp = [...document.querySelectorAll('input')]
+    .find(i => i.offsetParent !== null && !skip.includes(i.type) && (i.value || '').trim() === '1');
+  if (!inp) return false;
+  inp.setAttribute('data-qty-target', '1');
+  return true;
+}"""
+
 
 def log(msg):
     print(f"[{time.time() - T0:6.1f}s] {msg}", flush=True)
@@ -359,32 +393,59 @@ def read_options(page):
     return parse_options(body), text[:80]
 
 
-def read_remain(page):
+# ---------- 남은 수량 ----------
+
+def start_watch(page):
+    try:
+        page.evaluate(WATCH_JS)
+    except Exception as e:
+        log(f"안내 감시 시작 실패(무시): {str(e)[:60]}")
+
+
+def watched_remain(page):
+    """감시 장치가 잡은 숫자, 또는 지금 화면에 보이는 안내의 숫자. 없으면 None."""
+    try:
+        vals = page.evaluate("() => window.__remain || []")
+        if vals:
+            return int(str(vals[-1]).replace(",", ""))
+    except Exception:
+        pass
+    try:
+        t = page.get_by_text(REMAIN_RE).first
+        if t.is_visible():
+            m = REMAIN_RE.search(t.inner_text())
+            if m:
+                return int(m.group(1).replace(",", ""))
+    except Exception:
+        pass
+    return None
+
+
+def wait_remain(page, ms):
+    end = time.time() + ms / 1000
+    while True:
+        r = watched_remain(page)
+        if r is not None or time.time() >= end:
+            return r
+        page.wait_for_timeout(250)
+
+
+def read_remain(page, watch=True):
     """구매수량 칸 / + 버튼을 눌러 '재고가 N개 남았습니다' 안내를 읽는다. 못 읽으면 None."""
     try:
-        found = page.evaluate("""() => {
-            document.querySelectorAll('[data-qty-target]').forEach(e => e.removeAttribute('data-qty-target'));
-            const skip = ['checkbox', 'radio', 'hidden', 'button', 'submit'];
-            const inp = [...document.querySelectorAll('input')]
-                .find(i => i.offsetParent !== null && !skip.includes(i.type) && (i.value || '').trim() === '1');
-            if (!inp) return false;
-            inp.setAttribute('data-qty-target', '1');
-            return true;
-        }""")
-        if not found:
-            return None
+        if watch:
+            start_watch(page)
+        if not page.evaluate(MARK_QTY_JS):
+            return watched_remain(page)
         qty = page.locator("[data-qty-target]").first
-        toast = page.get_by_text(REMAIN_RE).first
-        # 1) 수량 칸 클릭 → 2) 바로 옆 + 버튼 클릭, 순서대로 안내가 뜨는지 확인
         for target, wait_ms in ((qty, 1500), (qty.locator("xpath=following::button[1]"), 2500)):
             try:
                 target.click(timeout=3000)
-                toast.wait_for(state="visible", timeout=wait_ms)
-                m = REMAIN_RE.search(toast.inner_text())
-                if m:
-                    return int(m.group(1).replace(",", ""))
             except Exception:
                 continue
+            r = wait_remain(page, wait_ms)
+            if r is not None:
+                return r
         return None
     except Exception as e:
         log(f"남은 수량 읽기 실패(무시): {str(e)[:60]}")
@@ -413,7 +474,7 @@ def select_option(page, oname):
     if item is None:
         return False
     item.click(timeout=3000)
-    page.wait_for_timeout(1000)
+    page.wait_for_timeout(300)
     return True
 
 
@@ -431,10 +492,17 @@ def read_option_remains(page, goods_no, options):
                 time.sleep(random.uniform(*GAP))
                 open_page(page, detail_url(goods_no))
             first = False
-            if select_option(page, oname):
-                remains[oname] = read_remain(page)
-            else:
+            start_watch(page)                       # 옵션을 고르기 전부터 안내를 지켜봄
+            if not select_option(page, oname):
                 log(f"{goods_no} 옵션 '{oname[:20]}' 선택 실패(무시)")
+                continue
+            r = wait_remain(page, 2000)             # 옵션을 고르자마자 뜨는 안내
+            if r is None:
+                r = read_remain(page, watch=False)  # 안 뜨면 수량 칸 / + 버튼을 눌러 봄
+            if r is None:
+                has_qty = page.evaluate(MARK_QTY_JS)
+                log(f"{goods_no} 옵션 '{oname[:20]}' 남은 수량 안내 못 찾음 (수량칸 {'있음' if has_qty else '없음'})")
+            remains[oname] = r
         except Exception as e:
             log(f"{goods_no} 옵션 '{oname[:20]}' 남은 수량 확인 실패(무시): {str(e)[:60]}")
     return remains
@@ -562,150 +630,4 @@ def run_stock(page, prev):
         rm = {}
         if g in stock:
             s = stock[g]
-            rm = s.get("remains", {})
-            if s["options"]:
-                valid = {k for k, sold in s["options"].items() if not sold}
-            else:
-                valid = set() if s["soldout"] else {""}
-            # 품절됐거나 없어진 옵션은 '부족' 상태를 지움 (품절 알림이 따로 감)
-            lows = {k: True for k, v in old_lows.items() if v and k in valid}
-            for k, r in rm.items():
-                if r is None:
-                    continue                       # 이번에 숫자를 못 읽었으면 이전 상태 유지
-                was = old_lows.get(k, False)
-                now = r < LOW_STOCK
-                label = f"[{k}] " if k else ""
-                if now:
-                    lows[k] = True
-                    if not was:
-                        low_msgs.append(f"  · 🟠 재고 부족 {label}{r}개 남음 ({LOW_STOCK}개 미만)")
-                else:
-                    lows.pop(k, None)
-                    if was:
-                        low_msgs.append(f"  · 🟢 재고 다시 넉넉함 {label}{r}개 남음")
-            cur = {"name": s["name"] or old.get("name", ""), "soldout": s["soldout"], "options": s["options"],
-                   "remains": {k: r for k, r in rm.items() if r is not None}, "lows": lows}
-        else:
-            cur = {"name": old.get("name", ""), "soldout": old.get("soldout"), "options": old.get("options", {}),
-                   "remains": old.get("remains", {}), "lows": old_lows}
-            if g in fails:
-                now_errors[g] = fails[g]
-            elif g in prev_errors:
-                now_errors[g] = prev_errors[g]
-        now_items[g] = cur
-
-        changed = (old.get("soldout"), old.get("options", {})) != (cur["soldout"], cur["options"])
-        if changed and g in stock:
-            changed_cnt += 1
-        if low_msgs:
-            low_cnt += 1
-        if not (changed or low_msgs or ALWAYS) or g not in stock:
-            continue
-        if changed and g in old_items:
-            tag = "⚠️ 변화 "
-        elif any("🟠" in m for m in low_msgs):
-            tag = "🟠 재고 부족 "
-        else:
-            tag = ""
-        title = f"{cur['name']} ({g})" if cur["name"] else g
-        lines = [f"{tag}{title}"]
-        opts = cur["options"] or {}
-        if opts:
-            sold = sum(1 for v in opts.values() if v)
-            lines.append(f"  · 재고: 옵션 {len(opts)}개 중 {sold}개 품절 ({stock_label(cur['soldout'])})")
-            old_opts = old.get("options") or {}
-            for oname, v in opts.items():
-                mark = ""
-                if oname in old_opts and old_opts[oname] != v:
-                    mark = f" ← 변화 (이전: {'품절' if old_opts[oname] else '판매중'})"
-                rem = f" · 남은 {rm[oname]}개" if rm.get(oname) is not None else ""
-                lines.append(f"      - {oname}: {stock_label(v)}{rem}{mark}")
-        else:
-            prev_label = f" (이전: {stock_label(old.get('soldout'))})" if changed and g in old_items else ""
-            rem = f" · 남은 수량 {rm['']}개" if rm.get("") is not None else ""
-            lines.append(f"  · 재고: {stock_label(cur['soldout'])}{prev_label}{rem}")
-        lines.extend(low_msgs)
-        lines.append(f"  {detail_url(g)}")
-        blocks.append("\n".join(lines))
-
-    err_lines = []
-    for g, msg in fails.items():
-        if prev_errors.get(g) != msg:
-            label = now_items[g].get("name") or g
-            err_lines.append(f"{label} ({g}) 재고 실패: {msg}")
-    if stopped:
-        err_lines.append(f"중단: {stopped}")
-        log(f"중단: {stopped}")
-    if err_lines:
-        shown = err_lines[:10]
-        extra = f"\n...외 {len(err_lines) - 10}건" if len(err_lines) > 10 else ""
-        blocks.append("❗ 확인 실패/중단 (이전 값 유지)\n" + "\n".join(shown) + extra)
-
-    has_issue = bool(changed_cnt or low_cnt or err_lines)
-
-    # ALWAYS_NOTIFY=1이면 변화가 없어도 상품별 한 줄 요약을 붙임
-    summary_lines = []
-    if ALWAYS:
-        for g in GOODS:
-            if g not in stock:
-                continue
-            it = now_items[g]
-            opts = it["options"] or {}
-            extra = f" (옵션 {len(opts)}개 중 {sum(opts.values())}개 품절)" if opts else ""
-            r = stock[g].get("remains", {}).get("")
-            if r is not None:
-                extra += f" (남은 수량 {r}개)"
-            summary_lines.append(f"· {it['name'] or g}: {stock_label(it['soldout'])}{extra}")
-
-    if SUMMARY_FILE:
-        Path(SUMMARY_FILE).write_text(json.dumps(
-            {"goods": len(GOODS), "checked": len(stock), "issue": has_issue, "lines": summary_lines},
-            ensure_ascii=False))
-
-    ts = now_ts()
-    if has_issue:
-        send_slack(f"📦 [올리브영 재고 {ts}] 상품 {len(GOODS)}개 확인", blocks)
-    elif SUMMARY_FILE:
-        log("변화 없음 → 통합 알림 job에서 한 번에 전송")
-    elif ALWAYS or NOTIFY_NO_CHANGE:
-        msg = f"✅ [올리브영 재고 {ts}] 상품 {len(GOODS)}개 체크했으나 변경점이 없습니다. (재고 확인 {len(stock)}개)"
-        if summary_lines:
-            msg += "\n" + "\n".join(summary_lines)
-        post_slack(msg)
-    else:
-        log("변화 없음 (알림 생략)")
-
-    return {"items": now_items, "errors": now_errors}
-
-
-# ======================================================================
-
-def main():
-    if MODE not in ("stock", "rank"):
-        sys.exit(f"MODE 값이 잘못됐습니다: {MODE!r} (stock 또는 rank)")
-    if not GOODS:
-        sys.exit("상품번호가 없습니다. (GOODS_NO Secret 확인)")
-
-    prev = load_state(STATE_FILE)
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--disable-blink-features=AutomationControlled"])
-        context = browser.new_context(user_agent=UA, locale="ko-KR", timezone_id="Asia/Seoul", viewport={"width": 1366, "height": 900})
-        context.add_init_script(STEALTH_JS)
-        page = context.new_page()
-        try:
-            if MODE == "rank":
-                new_state = run_rank(page, prev)
-            else:
-                new_state = run_stock(page, prev)
-        finally:
-            browser.close()
-
-    # 슬랙 전송이 성공한 뒤에만 상태 저장 (전송 실패 시 다음 실행에서 다시 알림)
-    STATE_FILE.write_text(json.dumps(new_state, ensure_ascii=False))
-    log(f"상태 저장 완료 ({STATE_FILE.name})")
-    log("끝")
-
-
-if __name__ == "__main__":
-    main()
+            rm =
