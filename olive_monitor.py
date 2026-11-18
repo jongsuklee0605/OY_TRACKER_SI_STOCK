@@ -49,6 +49,7 @@ RANK_RETRY = 3           # 랭킹 페이지 최대 시도 횟수
 RETRY_429 = 2            # 429가 뜨면 같은 상품을 최대 몇 번 다시 시도할지
 WAIT_429 = (20, 40)      # 429가 떴을 때 기다리는 시간 범위(초)
 GAP = (1.0, 2.0)         # 평소 상품 사이 대기 시간 범위(초)
+MAX_OPT_REMAIN = 15      # 상품 하나에서 남은 수량을 확인할 옵션 최대 개수
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 STEALTH_JS = "Object.defineProperty(navigator, 'webdriver', {get: () => undefined}); Object.defineProperty(navigator, 'languages', {get: () => ['ko-KR', 'ko', 'en-US']}); window.chrome = {runtime: {}};"
@@ -324,14 +325,17 @@ def parse_options(text):
     return options
 
 
-def read_options(page):
-    """옵션 상품이면 ({옵션: 품절여부}, 디버그글자), 옵션 없는 상품이면 None."""
+def find_option_header(page):
     loc = page.get_by_text("옵션을 선택해")
-    header = None
     for i in range(min(loc.count(), 5)):
         if loc.nth(i).is_visible():
-            header = loc.nth(i)
-            break
+            return loc.nth(i)
+    return None
+
+
+def read_options(page):
+    """옵션 상품이면 ({옵션: 품절여부}, 디버그글자), 옵션 없는 상품이면 None."""
+    header = find_option_header(page)
     if header is None:
         return None
 
@@ -387,6 +391,55 @@ def read_remain(page):
         return None
 
 
+def select_option(page, oname):
+    """옵션 목록을 열고 해당 옵션을 클릭. 성공하면 True."""
+    header = find_option_header(page)
+    if header is None:
+        return False
+    box = header.locator("xpath=ancestor::*[contains(., '원')][1]")
+
+    def visible_item():
+        loc = box.get_by_text(oname, exact=True)
+        for i in range(min(loc.count(), 5)):
+            if loc.nth(i).is_visible():
+                return loc.nth(i)
+        return None
+
+    item = visible_item()
+    if item is None:
+        header.click()
+        page.wait_for_timeout(700)
+        item = visible_item()
+    if item is None:
+        return False
+    item.click(timeout=3000)
+    page.wait_for_timeout(1000)
+    return True
+
+
+def read_option_remains(page, goods_no, options):
+    """판매중인 옵션을 하나씩 골라 남은 수량을 읽는다. 두 번째 옵션부터는 페이지를 새로 연다."""
+    remains = {}
+    first = True
+    targets = [n for n, sold in options.items() if not sold][:MAX_OPT_REMAIN]
+    for oname in targets:
+        if time.time() - T0 > TIME_LIMIT - 60:
+            log(f"{goods_no} 시간 부족 → 옵션 남은 수량 확인 일부 생략")
+            break
+        try:
+            if not first:
+                time.sleep(random.uniform(*GAP))
+                open_page(page, detail_url(goods_no))
+            first = False
+            if select_option(page, oname):
+                remains[oname] = read_remain(page)
+            else:
+                log(f"{goods_no} 옵션 '{oname[:20]}' 선택 실패(무시)")
+        except Exception as e:
+            log(f"{goods_no} 옵션 '{oname[:20]}' 남은 수량 확인 실패(무시): {str(e)[:60]}")
+    return remains
+
+
 class NoStockInfo(Exception):
     """페이지는 열렸지만 재고 상태를 판단할 수 없는 경우 (판매종료 등)"""
     pass
@@ -400,15 +453,16 @@ def get_stock(page, goods_no):
     if res is None:
         btns = [t.strip() for t in page.locator("button").all_inner_texts()]
         if any(("바로구매" in t or "구매하기" in t) for t in btns):
-            return {"name": name, "soldout": False, "options": {}, "remain": read_remain(page)}
+            return {"name": name, "soldout": False, "options": {}, "remains": {"": read_remain(page)}}
         if any("품절" in t for t in btns):
-            return {"name": name, "soldout": True, "options": {}, "remain": None}
+            return {"name": name, "soldout": True, "options": {}, "remains": {}}
         raise NoStockInfo("재고 상태를 판단할 수 없음 (구매 버튼을 못 찾음)")
 
     options, debug = res
     if not options:
         raise RuntimeError(f"옵션 목록을 읽지 못함: {debug!r}")
-    return {"name": name, "soldout": all(options.values()), "options": options, "remain": None}
+    remains = read_option_remains(page, goods_no, options)
+    return {"name": name, "soldout": all(options.values()), "options": options, "remains": remains}
 
 
 def stock_label(so):
@@ -416,10 +470,16 @@ def stock_label(so):
 
 
 def describe_stock(s, g):
+    rm = s.get("remains", {})
     if s["options"]:
-        desc = ", ".join(f"{n}({'품절' if v else '판매중'})" for n, v in s["options"].items())
-        return f"{s['name']} ({g}) 옵션 {len(s['options'])}개: {desc}"
-    rem = f", 남은 수량 {s['remain']}개" if s.get("remain") is not None else ""
+        parts = []
+        for n, v in s["options"].items():
+            st = "품절" if v else "판매중"
+            if rm.get(n) is not None:
+                st += f", 남은 {rm[n]}개"
+            parts.append(f"{n}({st})")
+        return f"{s['name']} ({g}) 옵션 {len(s['options'])}개: {', '.join(parts)}"
+    rem = f", 남은 수량 {rm['']}개" if rm.get("") is not None else ""
     return f"{s['name']} ({g}) {'품절' if s['soldout'] else '판매중'} (옵션 없음{rem})"
 
 
@@ -495,27 +555,39 @@ def run_stock(page, prev):
 
     for g in GOODS:
         old = old_items.get(g, {})
-        low_old = old.get("low", False)
-        low_msg = None
-        remain = None
+        old_lows = old.get("lows")
+        if old_lows is None:                       # 이전 버전 상태 파일 호환
+            old_lows = {"": True} if old.get("low") else {}
+        low_msgs = []
+        rm = {}
         if g in stock:
             s = stock[g]
-            remain = s.get("remain")
-            if s["soldout"]:
-                low = False
-            elif remain is None:
-                low = low_old          # 이번에 숫자를 못 읽었으면 이전 상태 유지 (알림 안 보냄)
+            rm = s.get("remains", {})
+            if s["options"]:
+                valid = {k for k, sold in s["options"].items() if not sold}
             else:
-                low = remain < LOW_STOCK
-                if low and not low_old:
-                    low_msg = f"  · 🟠 재고 부족: {remain}개 남음 ({LOW_STOCK}개 미만)"
-                elif not low and low_old:
-                    low_msg = f"  · 🟢 재고 다시 넉넉함: {remain}개 남음"
+                valid = set() if s["soldout"] else {""}
+            # 품절됐거나 없어진 옵션은 '부족' 상태를 지움 (품절 알림이 따로 감)
+            lows = {k: True for k, v in old_lows.items() if v and k in valid}
+            for k, r in rm.items():
+                if r is None:
+                    continue                       # 이번에 숫자를 못 읽었으면 이전 상태 유지
+                was = old_lows.get(k, False)
+                now = r < LOW_STOCK
+                label = f"[{k}] " if k else ""
+                if now:
+                    lows[k] = True
+                    if not was:
+                        low_msgs.append(f"  · 🟠 재고 부족 {label}{r}개 남음 ({LOW_STOCK}개 미만)")
+                else:
+                    lows.pop(k, None)
+                    if was:
+                        low_msgs.append(f"  · 🟢 재고 다시 넉넉함 {label}{r}개 남음")
             cur = {"name": s["name"] or old.get("name", ""), "soldout": s["soldout"], "options": s["options"],
-                   "remain": remain if remain is not None else old.get("remain"), "low": low}
+                   "remains": {k: r for k, r in rm.items() if r is not None}, "lows": lows}
         else:
             cur = {"name": old.get("name", ""), "soldout": old.get("soldout"), "options": old.get("options", {}),
-                   "remain": old.get("remain"), "low": low_old}
+                   "remains": old.get("remains", {}), "lows": old_lows}
             if g in fails:
                 now_errors[g] = fails[g]
             elif g in prev_errors:
@@ -525,13 +597,13 @@ def run_stock(page, prev):
         changed = (old.get("soldout"), old.get("options", {})) != (cur["soldout"], cur["options"])
         if changed and g in stock:
             changed_cnt += 1
-        if low_msg:
+        if low_msgs:
             low_cnt += 1
-        if not (changed or low_msg or ALWAYS) or g not in stock:
+        if not (changed or low_msgs or ALWAYS) or g not in stock:
             continue
         if changed and g in old_items:
             tag = "⚠️ 변화 "
-        elif low_msg and cur["low"]:
+        elif any("🟠" in m for m in low_msgs):
             tag = "🟠 재고 부족 "
         else:
             tag = ""
@@ -546,13 +618,13 @@ def run_stock(page, prev):
                 mark = ""
                 if oname in old_opts and old_opts[oname] != v:
                     mark = f" ← 변화 (이전: {'품절' if old_opts[oname] else '판매중'})"
-                lines.append(f"      - {oname}: {stock_label(v)}{mark}")
+                rem = f" · 남은 {rm[oname]}개" if rm.get(oname) is not None else ""
+                lines.append(f"      - {oname}: {stock_label(v)}{rem}{mark}")
         else:
             prev_label = f" (이전: {stock_label(old.get('soldout'))})" if changed and g in old_items else ""
-            rem = f" · 남은 수량 {remain}개" if remain is not None else ""
+            rem = f" · 남은 수량 {rm['']}개" if rm.get("") is not None else ""
             lines.append(f"  · 재고: {stock_label(cur['soldout'])}{prev_label}{rem}")
-        if low_msg:
-            lines.append(low_msg)
+        lines.extend(low_msgs)
         lines.append(f"  {detail_url(g)}")
         blocks.append("\n".join(lines))
 
@@ -580,7 +652,7 @@ def run_stock(page, prev):
             it = now_items[g]
             opts = it["options"] or {}
             extra = f" (옵션 {len(opts)}개 중 {sum(opts.values())}개 품절)" if opts else ""
-            r = stock[g].get("remain")
+            r = stock[g].get("remains", {}).get("")
             if r is not None:
                 extra += f" (남은 수량 {r}개)"
             summary_lines.append(f"· {it['name'] or g}: {stock_label(it['soldout'])}{extra}")
