@@ -1,6 +1,6 @@
 """
 올리브영 재고 / 랭킹 모니터 → 슬랙 알림
-MODE=stock : 상품별 재고(옵션별 품절) 체크
+MODE=stock : 상품별 재고(옵션별 품절 + 남은 수량) 체크
 MODE=rank  : 랭킹 페이지에서 상품 순위 체크
 
 환경변수
@@ -9,7 +9,8 @@ MODE=rank  : 랭킹 페이지에서 상품 순위 체크
   GOODS_NO           (필수) 상품번호, 쉼표로 여러 개
   RANK_URLS          (선택) 랭킹 페이지, "이름|URL" 을 쉼표로 여러 개. 안 넣으면 전체 랭킹만
   ALWAYS_NOTIFY      (선택) 1이면 변화 없어도 매번 상품별 요약 알림
-  NOTIFY_NO_CHANGE   (선택) 0이면 '변경점 없음' 알림을 보내지 않음 (기본 1)
+  NOTIFY_NO_CHANGE   (선택) 1이면 '변경점 없음' 알림도 보냄 (기본 0 = 안 보냄)
+  LOW_STOCK          (선택) 남은 수량이 이 숫자 미만이 되면 알림 (기본 20)
   SUMMARY_FILE       (선택) 재고 모드에서 지정하면 '변경점 없음'은 보내지 않고 이 파일에 결과를 기록
                             (여러 묶음을 합쳐 한 번에 보내는 통합 job 용)
 """
@@ -32,6 +33,7 @@ GOODS = list(dict.fromkeys(g.strip() for g in RAW_GOODS.split(",") if g.strip())
 ALWAYS = os.environ.get("ALWAYS_NOTIFY") == "1"
 NOTIFY_NO_CHANGE = os.environ.get("NOTIFY_NO_CHANGE", "0") == "1"
 SUMMARY_FILE = os.environ.get("SUMMARY_FILE", "").strip()
+LOW_STOCK = int(os.environ.get("LOW_STOCK", "20"))   # 남은 수량이 이 숫자 미만이면 알림
 
 DEFAULT_RANK = "전체|https://www.oliveyoung.co.kr/store/main/getBestList.do"
 MAIN_URL = "https://www.oliveyoung.co.kr/store/main/main.do"
@@ -55,6 +57,7 @@ KST = timezone(timedelta(hours=9))
 T0 = time.time()
 PRICE_RE = re.compile(r"\d[\d,]*\s*원")
 NOISE_RE = re.compile(r"^(예약|일시품절|품절|재입고|오늘드림|옵션을 선택|배송|구매수량|총\s)|배송시작|^\d+\s*%|^\(")
+REMAIN_RE = re.compile(r"재고가\s*([\d,]+)\s*개\s*남았")
 
 
 def log(msg):
@@ -352,6 +355,38 @@ def read_options(page):
     return parse_options(body), text[:80]
 
 
+def read_remain(page):
+    """구매수량 칸 / + 버튼을 눌러 '재고가 N개 남았습니다' 안내를 읽는다. 못 읽으면 None."""
+    try:
+        found = page.evaluate("""() => {
+            document.querySelectorAll('[data-qty-target]').forEach(e => e.removeAttribute('data-qty-target'));
+            const skip = ['checkbox', 'radio', 'hidden', 'button', 'submit'];
+            const inp = [...document.querySelectorAll('input')]
+                .find(i => i.offsetParent !== null && !skip.includes(i.type) && (i.value || '').trim() === '1');
+            if (!inp) return false;
+            inp.setAttribute('data-qty-target', '1');
+            return true;
+        }""")
+        if not found:
+            return None
+        qty = page.locator("[data-qty-target]").first
+        toast = page.get_by_text(REMAIN_RE).first
+        # 1) 수량 칸 클릭 → 2) 바로 옆 + 버튼 클릭, 순서대로 안내가 뜨는지 확인
+        for target, wait_ms in ((qty, 1500), (qty.locator("xpath=following::button[1]"), 2500)):
+            try:
+                target.click(timeout=3000)
+                toast.wait_for(state="visible", timeout=wait_ms)
+                m = REMAIN_RE.search(toast.inner_text())
+                if m:
+                    return int(m.group(1).replace(",", ""))
+            except Exception:
+                continue
+        return None
+    except Exception as e:
+        log(f"남은 수량 읽기 실패(무시): {str(e)[:60]}")
+        return None
+
+
 class NoStockInfo(Exception):
     """페이지는 열렸지만 재고 상태를 판단할 수 없는 경우 (판매종료 등)"""
     pass
@@ -365,15 +400,15 @@ def get_stock(page, goods_no):
     if res is None:
         btns = [t.strip() for t in page.locator("button").all_inner_texts()]
         if any(("바로구매" in t or "구매하기" in t) for t in btns):
-            return {"name": name, "soldout": False, "options": {}}
+            return {"name": name, "soldout": False, "options": {}, "remain": read_remain(page)}
         if any("품절" in t for t in btns):
-            return {"name": name, "soldout": True, "options": {}}
+            return {"name": name, "soldout": True, "options": {}, "remain": None}
         raise NoStockInfo("재고 상태를 판단할 수 없음 (구매 버튼을 못 찾음)")
 
     options, debug = res
     if not options:
         raise RuntimeError(f"옵션 목록을 읽지 못함: {debug!r}")
-    return {"name": name, "soldout": all(options.values()), "options": options}
+    return {"name": name, "soldout": all(options.values()), "options": options, "remain": None}
 
 
 def stock_label(so):
@@ -384,7 +419,8 @@ def describe_stock(s, g):
     if s["options"]:
         desc = ", ".join(f"{n}({'품절' if v else '판매중'})" for n, v in s["options"].items())
         return f"{s['name']} ({g}) 옵션 {len(s['options'])}개: {desc}"
-    return f"{s['name']} ({g}) {'품절' if s['soldout'] else '판매중'} (옵션 없음)"
+    rem = f", 남은 수량 {s['remain']}개" if s.get("remain") is not None else ""
+    return f"{s['name']} ({g}) {'품절' if s['soldout'] else '판매중'} (옵션 없음{rem})"
 
 
 def get_stock_with_429_retry(page, g, label):
@@ -404,7 +440,7 @@ def get_stock_with_429_retry(page, g, label):
 
 
 def run_stock(page, prev):
-    log(f"[재고 모드] 상품 {len(GOODS)}개")
+    log(f"[재고 모드] 상품 {len(GOODS)}개, 재고 부족 기준 {LOW_STOCK}개 미만")
     stock, fails = {}, {}
     no_info = set()
     consec_fail = 0
@@ -455,14 +491,31 @@ def run_stock(page, prev):
     prev_errors = prev["errors"]
     now_items, now_errors, blocks = {}, {}, []
     changed_cnt = 0
+    low_cnt = 0
 
     for g in GOODS:
         old = old_items.get(g, {})
+        low_old = old.get("low", False)
+        low_msg = None
+        remain = None
         if g in stock:
             s = stock[g]
-            cur = {"name": s["name"] or old.get("name", ""), "soldout": s["soldout"], "options": s["options"]}
+            remain = s.get("remain")
+            if s["soldout"]:
+                low = False
+            elif remain is None:
+                low = low_old          # 이번에 숫자를 못 읽었으면 이전 상태 유지 (알림 안 보냄)
+            else:
+                low = remain < LOW_STOCK
+                if low and not low_old:
+                    low_msg = f"  · 🟠 재고 부족: {remain}개 남음 ({LOW_STOCK}개 미만)"
+                elif not low and low_old:
+                    low_msg = f"  · 🟢 재고 다시 넉넉함: {remain}개 남음"
+            cur = {"name": s["name"] or old.get("name", ""), "soldout": s["soldout"], "options": s["options"],
+                   "remain": remain if remain is not None else old.get("remain"), "low": low}
         else:
-            cur = {"name": old.get("name", ""), "soldout": old.get("soldout"), "options": old.get("options", {})}
+            cur = {"name": old.get("name", ""), "soldout": old.get("soldout"), "options": old.get("options", {}),
+                   "remain": old.get("remain"), "low": low_old}
             if g in fails:
                 now_errors[g] = fails[g]
             elif g in prev_errors:
@@ -472,9 +525,16 @@ def run_stock(page, prev):
         changed = (old.get("soldout"), old.get("options", {})) != (cur["soldout"], cur["options"])
         if changed and g in stock:
             changed_cnt += 1
-        if not (changed or ALWAYS) or g not in stock:
+        if low_msg:
+            low_cnt += 1
+        if not (changed or low_msg or ALWAYS) or g not in stock:
             continue
-        tag = "⚠️ 변화 " if changed and g in old_items else ""
+        if changed and g in old_items:
+            tag = "⚠️ 변화 "
+        elif low_msg and cur["low"]:
+            tag = "🟠 재고 부족 "
+        else:
+            tag = ""
         title = f"{cur['name']} ({g})" if cur["name"] else g
         lines = [f"{tag}{title}"]
         opts = cur["options"] or {}
@@ -489,7 +549,10 @@ def run_stock(page, prev):
                 lines.append(f"      - {oname}: {stock_label(v)}{mark}")
         else:
             prev_label = f" (이전: {stock_label(old.get('soldout'))})" if changed and g in old_items else ""
-            lines.append(f"  · 재고: {stock_label(cur['soldout'])}{prev_label}")
+            rem = f" · 남은 수량 {remain}개" if remain is not None else ""
+            lines.append(f"  · 재고: {stock_label(cur['soldout'])}{prev_label}{rem}")
+        if low_msg:
+            lines.append(low_msg)
         lines.append(f"  {detail_url(g)}")
         blocks.append("\n".join(lines))
 
@@ -506,7 +569,7 @@ def run_stock(page, prev):
         extra = f"\n...외 {len(err_lines) - 10}건" if len(err_lines) > 10 else ""
         blocks.append("❗ 확인 실패/중단 (이전 값 유지)\n" + "\n".join(shown) + extra)
 
-    has_issue = bool(changed_cnt or err_lines)
+    has_issue = bool(changed_cnt or low_cnt or err_lines)
 
     # ALWAYS_NOTIFY=1이면 변화가 없어도 상품별 한 줄 요약을 붙임
     summary_lines = []
@@ -517,6 +580,9 @@ def run_stock(page, prev):
             it = now_items[g]
             opts = it["options"] or {}
             extra = f" (옵션 {len(opts)}개 중 {sum(opts.values())}개 품절)" if opts else ""
+            r = stock[g].get("remain")
+            if r is not None:
+                extra += f" (남은 수량 {r}개)"
             summary_lines.append(f"· {it['name'] or g}: {stock_label(it['soldout'])}{extra}")
 
     if SUMMARY_FILE:
