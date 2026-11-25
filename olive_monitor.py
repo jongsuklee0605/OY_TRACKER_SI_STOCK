@@ -33,7 +33,7 @@ GOODS = list(dict.fromkeys(g.strip() for g in RAW_GOODS.split(",") if g.strip())
 ALWAYS = os.environ.get("ALWAYS_NOTIFY") == "1"
 NOTIFY_NO_CHANGE = os.environ.get("NOTIFY_NO_CHANGE", "0") == "1"
 SUMMARY_FILE = os.environ.get("SUMMARY_FILE", "").strip()
-LOW_STOCK = int(os.environ.get("LOW_STOCK", "20"))   # 이 수량이 안 들어가면 재고 부족
+LOW_STOCK = int(os.environ.get("LOW_STOCK", "30"))   # 이 수량이 안 들어가면 재고 부족
 
 DEFAULT_RANK = "전체|https://www.oliveyoung.co.kr/store/main/getBestList.do"
 MAIN_URL = "https://www.oliveyoung.co.kr/store/main/main.do"
